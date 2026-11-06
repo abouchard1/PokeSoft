@@ -221,3 +221,34 @@ export const FINGERPRINT_INIT_SCRIPT = `(() => {
     return data;
   };
 })();`;
+
+/**
+ * Turns off WebAuthn (passkeys) in every browser we drive. Amazon's sign-in
+ * tries a passkey first and, after login, nudges to create one
+ * (`/ax/claim/webauthn/nudge`). On Windows, Chromium hands those calls to the
+ * OS, which pops a "Sécurité Windows" / Windows Hello PIN dialog on the
+ * operator's desktop — one per login, from headed AND headless sessions.
+ * Reporting no platform authenticator and refusing publicKey requests makes
+ * Amazon fall back to the password form, which is what we automate anyway.
+ * Non-WebAuthn credential calls (password/federated) pass through untouched.
+ * Independent of the fingerprint: applied to every context.
+ */
+export const NO_PASSKEY_INIT_SCRIPT = `(() => {
+  try {
+    const deny = () =>
+      Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+    const creds = navigator.credentials;
+    if (creds) {
+      const origGet = creds.get.bind(creds);
+      const origCreate = creds.create.bind(creds);
+      creds.get = (opts) => (opts && opts.publicKey ? deny() : origGet(opts));
+      creds.create = (opts) => (opts && opts.publicKey ? deny() : origCreate(opts));
+    }
+    const PKC = window.PublicKeyCredential;
+    if (PKC) {
+      PKC.isUserVerifyingPlatformAuthenticatorAvailable = () => Promise.resolve(false);
+      if (PKC.isConditionalMediationAvailable) PKC.isConditionalMediationAvailable = () => Promise.resolve(false);
+      if (PKC.getClientCapabilities) PKC.getClientCapabilities = () => Promise.resolve({});
+    }
+  } catch (_) {}
+})();`;

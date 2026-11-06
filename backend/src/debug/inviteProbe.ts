@@ -13,7 +13,7 @@ import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { accountsStore } from '../accounts.js';
 import { proxyStore } from '../proxies.js';
-import { FINGERPRINT_INIT_SCRIPT } from '../fingerprint.js';
+import { FINGERPRINT_INIT_SCRIPT, NO_PASSKEY_INIT_SCRIPT } from '../fingerprint.js';
 
 const ASIN = process.argv[2] ?? 'B0GSSW2HQJ';
 const DO_CLICK = process.argv.includes('--click');
@@ -50,6 +50,7 @@ async function main() {
     locale: fp?.locale,
     timezoneId: fp?.timezoneId,
   });
+  await context.addInitScript({ content: NO_PASSKEY_INIT_SCRIPT });
   if (fp) {
     await context.addInitScript({
       content: `window.__POKESOFT_FP__ = ${JSON.stringify(fp)};\n${FINGERPRINT_INIT_SCRIPT}`,

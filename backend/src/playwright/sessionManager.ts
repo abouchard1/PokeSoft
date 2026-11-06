@@ -13,7 +13,7 @@ import { orderNumber, pollSms, smsProviderConfigured, type SmsOrder } from '../a
 import { solveFunCaptcha, captchaSolverConfigured } from '../amazon/captchaSolver.js';
 import { ordersStore } from '../amazon/ordersStore.js';
 import { scrapeOrderHistory, OrdersLoginRequired } from '../amazon/ordersScraper.js';
-import { FINGERPRINT_INIT_SCRIPT, type Fingerprint } from '../fingerprint.js';
+import { FINGERPRINT_INIT_SCRIPT, NO_PASSKEY_INIT_SCRIPT, type Fingerprint } from '../fingerprint.js';
 
 export type SessionAction = 'amazon' | 'amazon-register';
 
@@ -324,6 +324,7 @@ class SessionManager {
           locale: fp?.locale,
           timezoneId: fp?.timezoneId,
         });
+        await context.addInitScript({ content: NO_PASSKEY_INIT_SCRIPT });
         if (fp) await applyFingerprint(context, fp);
         if (options.blockResources) await this.applyResourceBlocking(context, options.blockResources);
         const page = context.pages()[0] ?? (await context.newPage());
@@ -332,6 +333,7 @@ class SessionManager {
 
       const browser = await chromium.launch({ headless: options.headless ?? true });
       const context = await browser.newContext(proxyConfig ? { proxy: proxyConfig } : undefined);
+      await context.addInitScript({ content: NO_PASSKEY_INIT_SCRIPT });
       if (options.blockResources) await this.applyResourceBlocking(context, options.blockResources);
       const page = await context.newPage();
       return { browser, context, page, localProxyUrl };
@@ -354,16 +356,8 @@ class SessionManager {
       // Via a proxy, Amazon often answers the first request with an AWS WAF JS
       // challenge (~2KB HTML that sets a cookie then reloads). Wait for the real
       // page to settle in instead of returning while the body is still empty.
-      await page
-        .waitForFunction(
-          () => {
-            const t = document.title || '';
-            const b = document.body ? document.body.innerText.length : 0;
-            return t.length > 5 && !t.startsWith('Loading') && b > 200;
-          },
-          { timeout: 20000 }
-        )
-        .catch((err) => console.warn(`[${sid}] settle wait: ${(err as Error).message}`));
+      // Also clicks through the "Continuer les achats" bot interstitial.
+      if (!(await this.settleAmazonPage(page))) console.warn(`[${sid}] settle wait: page toujours vide`);
       console.log(`[${sid}] navigated → ${page.url()}`);
       this.emit({ type: 'session.updated', session: session.summary() });
     } catch (err) {
@@ -618,7 +612,7 @@ class SessionManager {
         return { ok: false, status: 'login', message: 'Champ mot de passe introuvable (interstitiel cookies ?).' };
       }
       await password.fill(account.password);
-      await page.locator('input[name="rememberMe"]').first().check().catch(() => {});
+      await this.checkIfPresent(page, 'input[name="rememberMe"]');
       await page
         .locator('input#signInSubmit, #signInSubmit, input#auth-signin-button')
         .first()
@@ -648,8 +642,65 @@ class SessionManager {
     return { ok: true };
   }
 
+  /**
+   * Tick a checkbox only when it is actually on the page. A bare `.check()` on a
+   * missing element waits Playwright's full 30 s default before failing — with
+   * the field already filled, that read as "the form fills but never submits"
+   * (2026-11-06: Amazon dropped `rememberMe` from the sign-in page, and the
+   * email-code CVF page has no `rememberDevice`).
+   */
+  private async checkIfPresent(page: Page, selector: string): Promise<void> {
+    const box = page.locator(selector).first();
+    if ((await box.count()) === 0) return;
+    await box.check({ timeout: 3000, force: true }).catch(() => {});
+  }
+
+  /**
+   * Click through Amazon's "Cliquez sur le bouton ci-dessous pour continuer vos
+   * achats" bot interstitial — a near-empty page with a single "Continuer les
+   * achats" button, served to fresh profiles / new IPs instead of the homepage.
+   * It has no account nav, so without this the login could never start.
+   * The body-length cap keeps it from matching a real page (the cart also says
+   * "continuer vos achats"). Returns true when it was there and clicked.
+   */
+  private async passShoppingInterstitial(page: Page): Promise<boolean> {
+    const text = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    if (text.length > 800 || !/continuer vos achats/i.test(text)) return false;
+    const btn = page.locator('form button[type="submit"], form input[type="submit"]').first();
+    if ((await btn.count()) === 0) return false;
+    console.log('[amazon] interstitiel « Continuer les achats » → clic');
+    await btn.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    return true;
+  }
+
+  /**
+   * Wait until a real Amazon page is on screen: past the AWS WAF JS challenge
+   * (empty body that reloads itself) and past the "Continuer les achats"
+   * interstitial (clicked through). Returns false when the body never filled.
+   */
+  private async settleAmazonPage(page: Page, timeout = 20000): Promise<boolean> {
+    for (let pass = 0; pass < 3; pass++) {
+      const filled = await page
+        .waitForFunction(
+          () => {
+            const b = document.body ? document.body.innerText : '';
+            return b.length > 200 || /continuer vos achats/i.test(b);
+          },
+          undefined,
+          { timeout }
+        )
+        .then(() => true)
+        .catch(() => false);
+      if (!filled) return false;
+      if (!(await this.passShoppingInterstitial(page))) return true;
+    }
+    return (await page.locator('body').innerText().catch(() => '')).length > 200;
+  }
+
   /** Accept the Amazon cookie-consent banner if present (helps login settle). */
   private async acceptCookieBanner(page: Page): Promise<void> {
+    await this.passShoppingInterstitial(page);
     const accept = page.locator('#sp-cc-accept, input[name="accept"]').first();
     if ((await accept.count()) > 0) {
       await accept.click().catch(() => {});
@@ -702,11 +753,7 @@ class SessionManager {
     if ((await field.count()) === 0) return { ok: true, message: 'OTP déjà validé.' };
     await field.fill(code);
     // "Ne plus demander de code sur ce navigateur" — keeps the profile trusted.
-    await page
-      .locator('input[name="rememberDevice"], #auth-mfa-remember-device')
-      .first()
-      .check()
-      .catch(() => {});
+    await this.checkIfPresent(page, 'input[name="rememberDevice"], #auth-mfa-remember-device');
     // Click the ACTUAL submit button. The CVF page also carries a hidden
     // input[type=submit] earlier in the DOM, so a generic selector would click
     // that (a no-op) and the code would never be sent — target the real button.
@@ -1198,12 +1245,7 @@ class SessionManager {
    */
   private async gotoProductPage(page: Page, url: string) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    try {
-      await page.waitForFunction(
-        () => !!document.body && document.body.innerText.length > 200,
-        { timeout: 20000 }
-      );
-    } catch {
+    if (!(await this.settleAmazonPage(page))) {
       throw new Error('page vide (challenge WAF / proxy muet)');
     }
   }
@@ -1394,9 +1436,7 @@ class SessionManager {
       // without ever hitting an /ap/signin redirect. Headless here, so OTP is
       // resolved from the shared Gmail inbox (otpMailbox).
       await page.goto('https://www.amazon.fr/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page
-        .waitForFunction(() => !!document.body && document.body.innerText.length > 200, { timeout: 20000 })
-        .catch(() => {});
+      await this.settleAmazonPage(page);
       await this.acceptCookieBanner(page);
       if (!(await this.isLoggedIn(page))) {
         const login = await this.loginViaSigninLink(page, account);
@@ -1614,9 +1654,7 @@ class SessionManager {
       const page = launched.page;
 
       await page.goto('https://www.amazon.fr/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page
-        .waitForFunction(() => !!document.body && document.body.innerText.length > 200, { timeout: 20000 })
-        .catch(() => {});
+      await this.settleAmazonPage(page);
       await this.acceptCookieBanner(page);
       if (!(await this.isLoggedIn(page))) {
         const login = await this.loginViaSigninLink(page, account);
