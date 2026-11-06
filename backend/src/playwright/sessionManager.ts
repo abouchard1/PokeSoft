@@ -29,12 +29,23 @@ export interface SessionOptions {
    *  'aggressive' (image/css/font/media) for headless automation; 'light'
    *  (font/media, keeps images+css usable) for headed flows that may need a
    *  human-readable page (e.g. solving a captcha by hand). */
-  blockResources?: 'aggressive' | 'light';
+  blockResources?: ResourceBlockLevel;
 }
 
-const RESOURCE_BLOCK: Record<'aggressive' | 'light', Set<string>> = {
+type ResourceBlockLevel = 'aggressive' | 'light' | 'detect';
+
+const RESOURCE_BLOCK: Record<ResourceBlockLevel, Set<string>> = {
   aggressive: new Set(['image', 'stylesheet', 'font', 'media']),
   light: new Set(['font', 'media']),
+  // Detect-only invitation runs ("Vérifier l'état"), applied per tab. Images and
+  // scripts may go — nothing is clicked (blocking either only breaks the invite
+  // click handler), and the invite button, add-to-cart and buybox text are all
+  // server-rendered — but **CSS must stay**: Amazon ships both invitation-widget
+  // branches and only CSS hides the wrong one, so visibility checks need it.
+  // Verified 2026-11-06, 76 items: 0 verdict differences vs a full render,
+  // 61 s vs 125 s. Scripts are also what clears the AWS WAF challenge, so items
+  // that fail are retried on an unblocked tab.
+  detect: new Set(['image', 'font', 'media', 'script']),
 };
 
 const ACTION_URLS: Record<SessionAction, string> = {
@@ -120,6 +131,12 @@ const INVITE_BUTTON_SELECTOR = 'input[name="submit.inviteButton"]';
 const AMAZON_FR_MERCHANT_ID = 'A1X6FK5RDHNB96';
 /** Consecutive item failures that end a run (see the loop in `runInvitations`). */
 const MAX_CONSECUTIVE_ERRORS = 5;
+/** Parallel tabs (one context, one proxy) for a detect-only run. Benchmarked on
+ *  2026-11-06 (Remy Robert, 76 items): 1 tab 1.76 s/item, 3 tabs + images
+ *  blocked 0.96 s/item, identical verdicts. Kept low: one IP hitting Amazon. */
+const DETECT_TABS = 3;
+/** Amazon's own offer for a product (see AMAZON_FR_MERCHANT_ID). */
+const forcedOfferUrl = (asin: string) => `https://www.amazon.fr/dp/${asin}?m=${AMAZON_FR_MERCHANT_ID}`;
 /** Amazon's offer is buyable outright — the invitation was accepted. */
 const ADD_TO_CART_SELECTOR =
   '#add-to-cart-button, input[name="submit.add-to-cart"], #buy-now-button';
@@ -279,7 +296,7 @@ class SessionManager {
   }
 
   /** Abort image/css/font/media requests (per level) to save bandwidth + time. */
-  private async applyResourceBlocking(context: BrowserContext, level: 'aggressive' | 'light') {
+  private async applyResourceBlocking(context: BrowserContext, level: ResourceBlockLevel) {
     const blocked = RESOURCE_BLOCK[level];
     await context.route('**/*', (route) => {
       if (blocked.has(route.request().resourceType())) return route.abort().catch(() => {});
@@ -1295,53 +1312,57 @@ class SessionManager {
     dryRun: boolean,
     asin?: string
   ): Promise<{ status: InvitationStatus; message?: string }> {
-    if (/\/ap\/signin|\/ap\/cvf/.test(page.url())) {
+    const loginNeeded = () => /\/ap\/signin|\/ap\/cvf/.test(page.url());
+    if (loginNeeded()) {
       return { status: 'login', message: 'Connexion Amazon requise pour ce compte.' };
     }
-    const direct = await this.clickInviteButton(page, dryRun);
+    // Runs land straight on Amazon's forced offer (one navigation per item);
+    // a caller on the default product page still gets the two-step check.
+    let forced = page.url().includes(`m=${AMAZON_FR_MERCHANT_ID}`);
+    const direct = await this.clickInviteButton(page, dryRun, forced ? '(offre Amazon)' : undefined);
     if (direct) return direct;
 
-    const buybox = await this.readBuybox(page);
-    // A pending request ("Invitation demandée, merci !") shows no add-to-cart —
-    // settle it here without the extra navigation. If something *is* buyable we
-    // fall through to the forced-merchant check, which alone can tell an
-    // accepted invitation (`orderable`) from a marketplace offer sitting on top
-    // of a still-pending one.
-    if (/invitation/i.test(buybox) && (await page.locator(ADD_TO_CART_SELECTOR).count()) === 0) {
-      return { status: 'already', message: buybox.replace(/\s+/g, ' ').slice(0, 160) };
-    }
-
-    // Buybox held by someone else → force Amazon's own offer and re-check.
-    if (asin && !page.url().includes(`m=${AMAZON_FR_MERCHANT_ID}`)) {
-      await this.gotoProductPageWithRetry(
-        page,
-        `https://www.amazon.fr/dp/${asin}?m=${AMAZON_FR_MERCHANT_ID}`
-      );
-      if (/\/ap\/signin|\/ap\/cvf/.test(page.url())) {
+    let buybox = await this.readBuybox(page);
+    let marketplace = '';
+    if (!forced) {
+      // A pending request ("Invitation demandée, merci !") shows no add-to-cart —
+      // settle it here without the extra navigation. If something *is* buyable we
+      // fall through to the forced-merchant check, which alone can tell an
+      // accepted invitation (`orderable`) from a marketplace offer sitting on top
+      // of a still-pending one.
+      if (/invitation/i.test(buybox) && (await page.locator(ADD_TO_CART_SELECTOR).count()) === 0) {
+        return { status: 'already', message: buybox.replace(/\s+/g, ' ').slice(0, 160) };
+      }
+      if (!asin) return { status: 'unavailable', message: buybox.replace(/\s+/g, ' ').slice(0, 160) };
+      // Buybox held by someone else → force Amazon's own offer and re-check.
+      await this.gotoProductPageWithRetry(page, forcedOfferUrl(asin));
+      if (loginNeeded()) {
         return { status: 'login', message: 'Connexion Amazon requise pour ce compte.' };
       }
-      const forced = await this.clickInviteButton(page, dryRun, '(offre Amazon)');
-      if (forced) return forced;
-      const amazonBuybox = await this.readBuybox(page);
-      // Amazon's offer first: this is the decisive one, and the message is
-      // truncated — leading with the marketplace buybox would hide it.
-      const message = `offre Amazon: ${amazonBuybox} | buybox: ${buybox}`
-        .replace(/\s+/g, ' ')
-        .slice(0, 160);
-      // We're on Amazon's own offer (forced via `?m=`), and it takes an
-      // add-to-cart with no invite button: the invitation was **accepted** and
-      // the item can be ordered now. Only trustworthy in this forced context —
-      // in the default buybox an add-to-cart may belong to a marketplace seller.
-      // Checked before the "invitation" text test, since an accepted offer still
-      // mentions the invitation ("Vous avez été invité à acheter…").
-      if ((await page.locator(ADD_TO_CART_SELECTOR).count()) > 0) {
-        return { status: 'orderable', message };
-      }
-      if (/invitation/i.test(amazonBuybox)) return { status: 'already', message };
-      return { status: 'unavailable', message };
+      forced = true;
+      const again = await this.clickInviteButton(page, dryRun, '(offre Amazon)');
+      if (again) return again;
+      marketplace = buybox;
+      buybox = await this.readBuybox(page);
     }
 
-    return { status: 'unavailable', message: buybox.replace(/\s+/g, ' ').slice(0, 160) };
+    // On Amazon's own offer now. Amazon's buybox first: it is the decisive one,
+    // and the message is truncated — leading with a marketplace buybox would
+    // hide it.
+    const message = (marketplace ? `offre Amazon: ${buybox} | buybox: ${marketplace}` : `offre Amazon: ${buybox}`)
+      .replace(/\s+/g, ' ')
+      .slice(0, 160);
+    // Amazon's own offer (forced via `?m=`) takes an add-to-cart with no invite
+    // button: the invitation was **accepted** and the item can be ordered now.
+    // Only trustworthy in this forced context — in the default buybox an
+    // add-to-cart may belong to a marketplace seller. Checked before the
+    // "invitation" text test, since an accepted offer still mentions the
+    // invitation ("Vous avez été invité à acheter…").
+    if ((await page.locator(ADD_TO_CART_SELECTOR).count()) > 0) {
+      return { status: 'orderable', message };
+    }
+    if (/invitation/i.test(buybox)) return { status: 'already', message };
+    return { status: 'unavailable', message };
   }
 
   /**
@@ -1425,8 +1446,12 @@ class SessionManager {
       accountsStore.touch(accountId);
       this.emit({ type: 'account.updated', id: accountId });
       const page = launched.page;
-      const gotoItem = (item: (typeof items)[number]) =>
-        this.gotoProductPageWithRetry(page, item.productUrl || `https://www.amazon.fr/dp/${item.asin}`);
+      // One navigation per item, straight onto Amazon's own offer. The default
+      // product page only ever led to a second navigation there (when a
+      // marketplace seller held the buybox); benchmarked 2026-11-06 on 76 items:
+      // identical verdicts, −28 % time.
+      const gotoItem = (p: Page, item: (typeof items)[number]) =>
+        this.gotoProductPageWithRetry(p, forcedOfferUrl(item.asin));
       // Tracked across items so we attempt the login once, then stop retrying
       // if the credentials are rejected or an OTP/captcha challenge blocks us.
       let loginState: 'unknown' | 'ok' | 'failed' | 'otp' = 'unknown';
@@ -1454,44 +1479,57 @@ class SessionManager {
 
       this.setInvitationProgress(accountId, { status: 'running', done: 0, total: items.length });
       this.emit({ type: 'invitation.started', accountId, total: items.length, dryRun });
-      let done = 0;
-      // A run that keeps failing has lost its connection (dead proxy, network
-      // blip, Amazon cutting us off). Walking the rest of the catalogue then
-      // just stamps `error` on every item in a second or two and still reports
-      // "terminé" — so bail out loudly instead and leave the untouched items
-      // untouched, for a re-run to pick up.
-      let consecutiveErrors = 0;
-      const failed: typeof items = [];
-      for (const item of items) {
-        done++;
+      // A run where nothing can be clicked ("Vérifier l'état": dryRun, or only
+      // disabled items) fans out over a few tabs of the same context — same
+      // cookies, same proxy — with images and scripts blocked (CSS kept, see
+      // RESOURCE_BLOCK.detect). Benchmarked 2026-11-06 on 76 items: 2.46 s/item
+      // before (default page, then forced offer), 0.80 s/item now, identical
+      // verdicts. A run that may click stays on one unblocked tab: blocked
+      // images alone stop the invite click from firing. Blocking is per tab
+      // (not per context) so the error retry pass below runs on a clean one.
+      const detectRun = items.every((i) => dryRun || !i.enabled);
+      const pages: Page[] = [];
+      if (detectRun) {
+        const blocked = RESOURCE_BLOCK.detect;
+        for (let i = 0; i < DETECT_TABS; i++) {
+          const tab = await launched.context.newPage();
+          await tab.route('**/*', (route) =>
+            blocked.has(route.request().resourceType())
+              ? route.abort().catch(() => {})
+              : route.continue().catch(() => {})
+          );
+          pages.push(tab);
+        }
+      } else {
+        pages.push(page);
+      }
+
+      // A mid-run sign-in redirect is handled once for all tabs: the first tab
+      // to hit it logs in, the others wait on the same attempt.
+      let relogin: ReturnType<SessionManager['attemptLogin']> | undefined;
+      const checkItem = async (p: Page, item: (typeof items)[number]) => {
         // A disabled item is only being re-checked to refresh its verdict —
         // never request it, even outside dryRun.
         const detectOnly = dryRun || !item.enabled;
-        let result: { status: InvitationStatus; message?: string };
-        try {
-          await gotoItem(item);
-          result = await this.processInvitation(page, detectOnly, item.asin);
-          if (result.status === 'login' && loginState !== 'failed' && loginState !== 'otp') {
-            const login = await this.attemptLogin(page, account);
-            if (login.ok) {
-              loginState = 'ok';
-              await gotoItem(item);
-              result = await this.processInvitation(page, detectOnly, item.asin);
-            } else {
-              loginState = login.otp ? 'otp' : 'failed';
-              result = { status: login.status, message: login.message };
-            }
+        await gotoItem(p, item);
+        let result = await this.processInvitation(p, detectOnly, item.asin);
+        if (result.status === 'login' && loginState !== 'failed' && loginState !== 'otp') {
+          relogin ??= this.attemptLogin(p, account);
+          const login = await relogin;
+          if (login.ok) {
+            loginState = 'ok';
+            relogin = undefined; // a later redirect gets its own attempt
+            await gotoItem(p, item);
+            result = await this.processInvitation(p, detectOnly, item.asin);
+          } else {
+            loginState = login.otp ? 'otp' : 'failed';
+            result = { status: login.status, message: login.message };
           }
-        } catch (err) {
-          result = { status: 'error', message: (err as Error).message.slice(0, 160) };
         }
-        if (result.status === 'error') {
-          consecutiveErrors++;
-          failed.push(item);
-        } else {
-          consecutiveErrors = 0;
-        }
-        counts[result.status] = (counts[result.status] ?? 0) + 1;
+        return result;
+      };
+      const record = (item: (typeof items)[number], result: { status: InvitationStatus; message?: string }) => {
+        const detectOnly = dryRun || !item.enabled;
         const prev = invitationsStore.get(accountId, item.asin);
         invitationsStore.upsert({
           accountId,
@@ -1502,39 +1540,86 @@ class SessionManager {
             result.status === 'requested' && !detectOnly ? Date.now() : prev?.requestedAt,
           lastCheckedAt: Date.now(),
         });
-        this.setInvitationProgress(accountId, {
-          status: 'running',
-          done,
-          total: items.length,
-          lastStatus: result.status,
-          counts,
-        });
-        this.emit({
-          type: 'invitation.item',
-          accountId,
-          asin: item.asin,
-          status: result.status,
-          done,
-          total: items.length,
-        });
-        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          const left = items.length - done;
-          const message = `Connexion perdue après ${consecutiveErrors} échecs d'affilée — run interrompu, ${left} item(s) non traité(s). Vérifiez le proxy puis relancez.`;
-          this.setInvitationProgress(accountId, { status: 'error', done, counts, message });
-          this.emit({ type: 'invitation.error', accountId, message });
-          return;
+      };
+
+      let done = 0;
+      // A run that keeps failing has lost its connection (dead proxy, network
+      // blip, Amazon cutting us off). Walking the rest of the catalogue then
+      // just stamps `error` on every item in a second or two and still reports
+      // "terminé" — so bail out loudly instead and leave the untouched items
+      // untouched, for a re-run to pick up.
+      let consecutiveErrors = 0;
+      let aborted = false;
+      let next = 0;
+      const failed: typeof items = [];
+      // The unblocked tab, shared one item at a time: a blocked tab that fails
+      // (typically the AWS WAF challenge coming back — it needs scripts) retries
+      // there right away. Solving the challenge sets the cookie for the whole
+      // context, so the blocked tabs work again afterwards.
+      let cleanQueue: Promise<unknown> = Promise.resolve();
+      const onCleanTab = <T>(fn: () => Promise<T>): Promise<T> => {
+        const run = cleanQueue.then(fn, fn);
+        cleanQueue = run.catch(() => {});
+        return run;
+      };
+      const worker = async (p: Page) => {
+        while (!aborted && next < items.length) {
+          const item = items[next++];
+          let result: { status: InvitationStatus; message?: string };
+          try {
+            result = await checkItem(p, item);
+          } catch (err) {
+            result = { status: 'error', message: (err as Error).message.slice(0, 160) };
+            if (p !== page) {
+              result = await onCleanTab(() => checkItem(page, item)).catch((e) => ({
+                status: 'error' as const,
+                message: (e as Error).message.slice(0, 160),
+              }));
+            }
+          }
+          done++;
+          if (result.status === 'error') {
+            consecutiveErrors++;
+            failed.push(item);
+          } else {
+            consecutiveErrors = 0;
+          }
+          counts[result.status] = (counts[result.status] ?? 0) + 1;
+          record(item, result);
+          this.setInvitationProgress(accountId, {
+            status: 'running',
+            done,
+            total: items.length,
+            lastStatus: result.status,
+            counts,
+          });
+          this.emit({
+            type: 'invitation.item',
+            accountId,
+            asin: item.asin,
+            status: result.status,
+            done,
+            total: items.length,
+          });
+          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) aborted = true;
         }
+      };
+      await Promise.all(pages.map(worker));
+      if (aborted) {
+        const left = items.length - done;
+        const message = `Connexion perdue après ${consecutiveErrors} échecs d'affilée — run interrompu, ${left} item(s) non traité(s). Vérifiez le proxy puis relancez.`;
+        this.setInvitationProgress(accountId, { status: 'error', done, counts, message });
+        this.emit({ type: 'invitation.error', accountId, message });
+        return;
       }
 
       // Second pass over the items that errored: most failures here are
       // transient, and an item left in `error` was never actually checked.
       if (failed.length > 0 && failed.length < items.length) {
         for (const item of failed) {
-          const detectOnly = dryRun || !item.enabled;
           let result: { status: InvitationStatus; message?: string };
           try {
-            await gotoItem(item);
-            result = await this.processInvitation(page, detectOnly, item.asin);
+            result = await checkItem(page, item);
           } catch (err) {
             result = { status: 'error', message: (err as Error).message.slice(0, 160) };
           }
@@ -1542,16 +1627,7 @@ class SessionManager {
           if (counts.error) counts.error--;
           if (!counts.error) delete counts.error;
           counts[result.status] = (counts[result.status] ?? 0) + 1;
-          const prev = invitationsStore.get(accountId, item.asin);
-          invitationsStore.upsert({
-            accountId,
-            asin: item.asin,
-            status: result.status,
-            message: result.message,
-            requestedAt:
-              result.status === 'requested' && !detectOnly ? Date.now() : prev?.requestedAt,
-            lastCheckedAt: Date.now(),
-          });
+          record(item, result);
           this.setInvitationProgress(accountId, { status: 'running', lastStatus: result.status, counts });
           this.emit({
             type: 'invitation.item',
