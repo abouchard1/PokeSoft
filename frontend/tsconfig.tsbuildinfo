@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/tabs/actionstab.tsx","./src/tabs/amazontab.tsx","./src/tabs/carnettab.tsx","./src/tabs/cartestab.tsx","./src/tabs/generatortab.tsx","./src/tabs/groupestab.tsx","./src/tabs/proxiestab.tsx"],"version":"5.9.3"}
