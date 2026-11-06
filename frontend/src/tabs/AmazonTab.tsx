@@ -182,6 +182,7 @@ export default function AmazonTab() {
         setNotice(
           `${data.scraped} items récupérés · ${data.added} ajoutés, ${data.updated} mis à jour` +
             (data.absent ? `, ${data.absent} disparus du store → indispo` : '') +
+            (data.reclassified ? `, ${data.reclassified} rangés dans la bonne extension` : '') +
             ` · ${data.extensions.length} extensions`
         );
         await refresh();

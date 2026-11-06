@@ -29,6 +29,34 @@ export interface ScrapedItem {
 
 const DEFAULT_PATH = resolve(process.cwd(), '..', 'data', 'amazon-items.json');
 
+/** Comparison key for extension names: no accents, no case, no punctuation.
+ *  NFKD also folds "30ᵉ" into "30e". Amazon spells "Régne Delta" in its store
+ *  nav but "Règne Delta" in titles — both must land on the same key. */
+function extKey(s: string): string {
+  return s
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * The extension a product title names, among the known ones — or undefined.
+ * When several match ("Méga-Évolution – Règne Delta": series then set), the one
+ * that appears LAST in the title is the most specific and wins.
+ */
+function extensionFromTitle(title: string, known: Map<string, string>): string | undefined {
+  const t = ` ${extKey(title)} `;
+  let best: { name: string; pos: number } | undefined;
+  for (const [key, name] of known) {
+    if (!key) continue;
+    const pos = t.lastIndexOf(` ${key} `);
+    if (pos >= 0 && (!best || pos > best.pos)) best = { name, pos };
+  }
+  return best?.name;
+}
+
 class AmazonItemsStore {
   private path = process.env.AMAZON_ITEMS_FILE ?? DEFAULT_PATH;
   private items: AmazonItem[] = [];
@@ -51,6 +79,34 @@ class AmazonItemsStore {
     // Items saved before `inStore` existed: assume present until the next import
     // re-evaluates them, so old data isn't falsely flagged as absent.
     for (const it of this.items) if (typeof it.inStore !== 'boolean') it.inStore = true;
+    if (this.reclassify()) this.persist();
+  }
+
+  /**
+   * Re-file every item under the extension its TITLE names, falling back to the
+   * store page it was scraped from. The page alone is not reliable: an item is
+   * filed under whatever page it was last seen on, and once it leaves the store
+   * it is never re-scraped — so a Règne Delta display seen once on the
+   * 30ᵉ Anniversaire page stayed there for good. The title is the product's own
+   * identity and doesn't move. Spellings are unified on the latest scrape's
+   * (`preferred`), so a renamed store page doesn't split an extension in two.
+   * Returns the number of items moved.
+   */
+  private reclassify(preferred: string[] = []): number {
+    const known = new Map<string, string>();
+    for (const it of this.items) if (it.extension) known.set(extKey(it.extension), it.extension);
+    for (const name of preferred) if (name) known.set(extKey(name), name);
+    let moved = 0;
+    for (const it of this.items) {
+      const target =
+        extensionFromTitle(it.title, known) ?? known.get(extKey(it.extension)) ?? it.extension;
+      if (target !== it.extension) {
+        it.extension = target;
+        it.updatedAt = Date.now();
+        moved++;
+      }
+    }
+    return moved;
   }
 
   private persist() {
@@ -71,7 +127,13 @@ class AmazonItemsStore {
    * the existing `enabled` toggle and id so the user's selection survives a
    * re-import. Returns counts for reporting.
    */
-  upsertMany(scraped: ScrapedItem[]): { added: number; updated: number; absent: number; total: number } {
+  upsertMany(scraped: ScrapedItem[]): {
+    added: number;
+    updated: number;
+    absent: number;
+    reclassified: number;
+    total: number;
+  } {
     const now = Date.now();
     let added = 0;
     let updated = 0;
@@ -118,8 +180,9 @@ class AmazonItemsStore {
         }
       }
     }
+    const reclassified = this.reclassify(scraped.map((s) => s.extension));
     this.persist();
-    return { added, updated, absent, total: this.items.length };
+    return { added, updated, absent, reclassified, total: this.items.length };
   }
 
   setEnabled(id: string, enabled: boolean): AmazonItem | undefined {
