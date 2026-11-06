@@ -116,7 +116,7 @@ The **Commandes** tab (`CommandesTab.tsx`) shows each account's past Amazon orde
 
 ## Environment variables
 
-All backend-side. Loaded from `backend/.env` at startup via `backend/src/env.ts` (`process.loadEnvFile()`, Node ≥20.12 — no `dotenv` dep), imported FIRST in `index.ts` so the value is set before stores read it. `.env` is gitignored.
+All backend-side. Loaded at startup via `backend/src/env.ts` (`process.loadEnvFile()`, Node ≥20.12 — no `dotenv` dep) from `backend/.env` **and** the repo-root `.env` (backend one wins; shell vars win over both). Before 2026-11-06 only `backend/.env` was read and a root `.env` was silently ignored — every Gmail/smspool/Anti-Captcha feature then reads "non configuré". `env.ts` is imported FIRST in `index.ts` so the value is set before stores read it. `.env` is gitignored.
 
 - `PORT` (default 3210)
 - `PROXY_FILE` — path to the `host:port:user:pass` list
