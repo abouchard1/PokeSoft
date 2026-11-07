@@ -162,7 +162,6 @@ export default function ActionsTab({ connected: _connected }: Props) {
   const [proxyGroups, setProxyGroups] = useState<NamedGroup[]>([]);
   const [proxyGroupId, setProxyGroupId] = useState('');
   // Also visit disabled items, detect-only, so their verdict stops being frozen.
-  const [refreshDisabled, setRefreshDisabled] = useState(false);
   const [orderable, setOrderable] = useState<OrderableInvitation[]>([]);
   const [orderableLoading, setOrderableLoading] = useState(false);
   const [orderableError, setOrderableError] = useState<string | null>(null);
@@ -305,6 +304,9 @@ export default function ActionsTab({ connected: _connected }: Props) {
               }
             : r
         );
+        // An accepted invitation lands in "À commander" as soon as it's seen,
+        // not at the end of the scan.
+        if (msg.status === 'orderable') loadDetected();
       }
       if (msg.type === 'invitation.done') {
         setInvRuns((r) =>
@@ -413,12 +415,11 @@ export default function ActionsTab({ connected: _connected }: Props) {
   }
 
   /**
-   * `verify` = review every in-store item's current state without requesting
-   * anything (detect-only over enabled *and* disabled items). It's how an
-   * accepted invitation gets found: Amazon doesn't always send the acceptance
-   * mail, so the product page is the only reliable signal.
+   * Every run is a full check-up of every in-store item (enabled or not) — it's
+   * how an accepted invitation gets found, since Amazon doesn't always send the
+   * acceptance mail. `dryRun` (API only, no UI button any more) withholds the requests.
    */
-  async function runInvitations(dryRun: boolean, verify = false) {
+  async function runInvitations(dryRun: boolean) {
     if (selectedInv.length === 0) return;
     setInvError(null);
     setInvNotice(null);
@@ -440,7 +441,6 @@ export default function ActionsTab({ connected: _connected }: Props) {
           accountIds: selectedInv,
           proxyGroupId: proxyGroupId || undefined,
           dryRun,
-          refreshDisabled: verify ? true : refreshDisabled,
         }),
       });
     } catch (e) {
@@ -646,48 +646,22 @@ export default function ActionsTab({ connected: _connected }: Props) {
           <div>
             <h2 className="font-medium">Invitations Amazon</h2>
             <p className="text-xs text-zinc-500 mt-1">
-              Demande l'invitation d'achat pour tous les items activés du catalogue, en parallèle
-              pour les comptes cochés. Réutilisable : les items déjà demandés sont ignorés.
-              « Revérifier les décochés » visite aussi les items désactivés — en détection seule,
-              sans jamais les demander — pour que leur disponibilité puisse redevenir « dispo ».
+              Une seule action par compte coché : chaque produit du store est vérifié, puis selon
+              son état — <b>coché et pas encore demandé</b> → la demande part tout de suite ;
+              <b> invitation acceptée</b> → il passe dans « À commander » ; déjà demandé ou
+              indispo → rien à faire, l'état est juste mis à jour. Les produits décochés sont
+              vérifiés mais jamais demandés.
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <label
-              className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none mr-1"
-              title="Visite aussi les items décochés, sans jamais les demander, pour rafraîchir leur disponibilité. Sans ça un item décoché garde son verdict indéfiniment."
-            >
-              <input
-                type="checkbox"
-                checked={refreshDisabled}
-                onChange={(e) => setRefreshDisabled(e.target.checked)}
-                className="accent-emerald-600"
-              />
-              Revérifier les décochés
-            </label>
-            <button
-              onClick={() => runInvitations(true)}
-              disabled={selectedInv.length === 0}
-              title="Détecte sans rien demander"
-              className="bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm px-3 py-2 rounded"
-            >
-              Simuler
-            </button>
-            <button
-              onClick={() => runInvitations(true, true)}
-              disabled={selectedInv.length === 0}
-              title="Passe en revue TOUS les items du store (cochés ou non) sans rien demander, et relève ceux dont l'invitation a été acceptée — le mail d'acceptation n'est pas toujours envoyé."
-              className="inline-flex items-center gap-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm px-3 py-2 rounded"
-            >
-              <RefreshCw size={14} />
-              Vérifier l'état
-            </button>
             <button
               onClick={() => runInvitations(false)}
               disabled={selectedInv.length === 0}
-              className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded"
+              title="Vérifie chaque produit du store et agit selon son état : demande l'invitation des cochés pas encore demandés, range les invitations acceptées dans « À commander »."
+              className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded"
             >
-              Demander ({selectedInv.length})
+              <RefreshCw size={14} />
+              Scanner ({selectedInv.length})
             </button>
           </div>
         </div>
@@ -803,10 +777,10 @@ export default function ActionsTab({ connected: _connected }: Props) {
                               : run.queued
                                 ? 'en file d’attente… (5 runs en parallèle max)'
                                 : run.running
-                                  ? `${run.dryRun ? 'simulation' : 'demande'}… ${run.done}/${run.total}`
+                                  ? `${run.dryRun ? 'vérification' : 'scan'}… ${run.done}/${run.total}`
                                   : runErrors > 0
                                     ? `⚠ terminé, ${runErrors} item(s) en échec — à relancer`
-                                    : `terminé ${run.done}/${run.total}${run.dryRun ? ' (sim)' : ''}`}
+                                    : `terminé ${run.done}/${run.total}${run.dryRun ? ' (vérif)' : ''}`}
                           </span>
                         </div>
                         {!run.error && (
@@ -868,7 +842,7 @@ export default function ActionsTab({ connected: _connected }: Props) {
             <p className="text-xs text-zinc-500 mt-1">
               Deux sources : les mails Amazon « Félicitations, vous êtes invité à passer commande »
               de moins de 72 h (lecture Gmail seule, aucune action sur Amazon), et les acceptations
-              relevées directement sur la page produit par « Vérifier l'état » — Amazon n'envoie pas
+              relevées directement sur la page produit par « Scanner » — Amazon n'envoie pas
               toujours le mail.
             </p>
           </div>
@@ -975,7 +949,7 @@ export default function ActionsTab({ connected: _connected }: Props) {
             <p className="text-xs text-zinc-400 mb-2">
               <span className="text-sky-300 font-medium">Détectées sur la page produit</span> — l'offre
               Amazon est passée en achat direct pour ce compte, sans mail d'acceptation. Relève du
-              dernier « Vérifier l'état » ; la fenêtre de 72 h n'est pas connue ici.
+              dernier « Scanner » ; la fenêtre de 72 h n'est pas connue ici.
             </p>
             <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
               {detected.map((d) => {

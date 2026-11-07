@@ -1366,23 +1366,20 @@ class SessionManager {
   }
 
   /**
-   * For a chosen account, walk every enabled catalogue item and request its buy
-   * invitation. Re-runnable: items already requested (no button) are skipped,
-   * and items whose invitation has reset (button back) are requested again.
+   * Full check-up of one account: every catalogue item (enabled, plus disabled
+   * ones still in store) is checked, and — unless `dryRun` — every **enabled**
+   * item still offering "Demander une invitation" is requested. "Demander" and
+   * "Vérifier l'état" are the same run; `dryRun` only withholds the clicks.
+   * Re-runnable: items already requested (button hidden) are skipped, and items
+   * whose invitation has reset (button back) are requested again.
    *
-   * `refreshDisabled` also visits **disabled** items, but detect-only (never
-   * clicked, whatever `dryRun` says — disabled means "don't request"). Without
-   * it a disabled item is never re-checked, so its verdict is frozen: an item
-   * flagged `no` and then switched off (e.g. by "Désactiver les indispo") could
-   * never come back to `yes`, since a catalogue re-import refreshes `inStore`
-   * but never the run-based availability.
+   * Disabled items are visited but never clicked ("unchecked" = don't request).
+   * Without the visit their verdict would be frozen: an item flagged `no` and
+   * then switched off (e.g. by "Désactiver les indispo") could never come back
+   * to `yes`, since a catalogue re-import refreshes `inStore` but never the
+   * run-based availability.
    */
-  async runInvitations(
-    accountId: string,
-    dryRun = false,
-    proxyIdOverride?: string,
-    refreshDisabled = false
-  ): Promise<void> {
+  async runInvitations(accountId: string, dryRun = false, proxyIdOverride?: string): Promise<void> {
     // Guard failures are reported over the WS (not thrown): this runs
     // fire-and-forget, so the UI needs the signal to clear its pending state.
     const can = this.canStartInvitations(accountId);
@@ -1393,9 +1390,7 @@ class SessionManager {
     const account = accountsStore.get(accountId)!;
     // Disabled items are only worth re-checking while they're still in the store —
     // an out-of-store item reads `no` from `inStore`, which the import refreshes.
-    const items = amazonItemsStore
-      .list()
-      .filter((i) => i.enabled || (refreshDisabled && i.inStore !== false));
+    const items = amazonItemsStore.list().filter((i) => i.enabled || i.inStore !== false);
     if (items.length === 0) {
       this.emit({ type: 'invitation.error', accountId, message: 'Aucun item activé dans le catalogue.' });
       return;
@@ -1479,38 +1474,35 @@ class SessionManager {
 
       this.setInvitationProgress(accountId, { status: 'running', done: 0, total: items.length });
       this.emit({ type: 'invitation.started', accountId, total: items.length, dryRun });
-      // A run where nothing can be clicked ("Vérifier l'état": dryRun, or only
-      // disabled items) fans out over a few tabs of the same context — same
-      // cookies, same proxy — with images and scripts blocked (CSS kept, see
-      // RESOURCE_BLOCK.detect). Benchmarked 2026-11-06 on 76 items: 2.46 s/item
-      // before (default page, then forced offer), 0.80 s/item now, identical
-      // verdicts. A run that may click stays on one unblocked tab: blocked
-      // images alone stop the invite click from firing. Blocking is per tab
-      // (not per context) so the error retry pass below runs on a clean one.
-      const detectRun = items.every((i) => dryRun || !i.enabled);
+      // Check-up on a few light tabs of the same context — same cookies, same
+      // proxy — with images and scripts blocked (CSS kept, see
+      // RESOURCE_BLOCK.detect). They only *read* the page: benchmarked
+      // 2026-11-06 on 76 items, 2.46 s/item before (default page, then forced
+      // offer), 0.80 s/item now, identical verdicts. A click can't happen there
+      // (blocked images alone stop the invite click from firing), so an enabled
+      // item found requestable is handed to the unblocked `page`, which re-opens
+      // it and clicks. Most items are pending/unavailable, so a requesting run
+      // costs about what the check-up does. Blocking is per tab (not per
+      // context) so `page` stays clean.
       const pages: Page[] = [];
-      if (detectRun) {
-        const blocked = RESOURCE_BLOCK.detect;
-        for (let i = 0; i < DETECT_TABS; i++) {
-          const tab = await launched.context.newPage();
-          await tab.route('**/*', (route) =>
-            blocked.has(route.request().resourceType())
-              ? route.abort().catch(() => {})
-              : route.continue().catch(() => {})
-          );
-          pages.push(tab);
-        }
-      } else {
-        pages.push(page);
+      const blocked = RESOURCE_BLOCK.detect;
+      for (let i = 0; i < DETECT_TABS; i++) {
+        const tab = await launched.context.newPage();
+        await tab.route('**/*', (route) =>
+          blocked.has(route.request().resourceType())
+            ? route.abort().catch(() => {})
+            : route.continue().catch(() => {})
+        );
+        pages.push(tab);
       }
+      // A disabled item is only being re-checked to refresh its verdict — never
+      // request it, even outside dryRun.
+      const mayClick = (item: (typeof items)[number]) => !dryRun && item.enabled;
 
       // A mid-run sign-in redirect is handled once for all tabs: the first tab
       // to hit it logs in, the others wait on the same attempt.
       let relogin: ReturnType<SessionManager['attemptLogin']> | undefined;
-      const checkItem = async (p: Page, item: (typeof items)[number]) => {
-        // A disabled item is only being re-checked to refresh its verdict —
-        // never request it, even outside dryRun.
-        const detectOnly = dryRun || !item.enabled;
+      const checkItem = async (p: Page, item: (typeof items)[number], detectOnly: boolean) => {
         await gotoItem(p, item);
         let result = await this.processInvitation(p, detectOnly, item.asin);
         if (result.status === 'login' && loginState !== 'failed' && loginState !== 'otp') {
@@ -1529,7 +1521,6 @@ class SessionManager {
         return result;
       };
       const record = (item: (typeof items)[number], result: { status: InvitationStatus; message?: string }) => {
-        const detectOnly = dryRun || !item.enabled;
         const prev = invitationsStore.get(accountId, item.asin);
         invitationsStore.upsert({
           accountId,
@@ -1537,7 +1528,7 @@ class SessionManager {
           status: result.status,
           message: result.message,
           requestedAt:
-            result.status === 'requested' && !detectOnly ? Date.now() : prev?.requestedAt,
+            result.status === 'requested' && mayClick(item) ? Date.now() : prev?.requestedAt,
           lastCheckedAt: Date.now(),
         });
       };
@@ -1552,10 +1543,10 @@ class SessionManager {
       let aborted = false;
       let next = 0;
       const failed: typeof items = [];
-      // The unblocked tab, shared one item at a time: a blocked tab that fails
-      // (typically the AWS WAF challenge coming back — it needs scripts) retries
-      // there right away. Solving the challenge sets the cookie for the whole
-      // context, so the blocked tabs work again afterwards.
+      // The unblocked tab, shared one item at a time. It takes the clicks, and
+      // the retries of a light tab that failed (typically the AWS WAF challenge
+      // coming back — it needs scripts); solving the challenge there sets the
+      // cookie for the whole context, so the light tabs work again afterwards.
       let cleanQueue: Promise<unknown> = Promise.resolve();
       const onCleanTab = <T>(fn: () => Promise<T>): Promise<T> => {
         const run = cleanQueue.then(fn, fn);
@@ -1566,16 +1557,18 @@ class SessionManager {
         while (!aborted && next < items.length) {
           const item = items[next++];
           let result: { status: InvitationStatus; message?: string };
+          const onClean = () =>
+            onCleanTab(() => checkItem(page, item, !mayClick(item))).catch((e) => ({
+              status: 'error' as const,
+              message: (e as Error).message.slice(0, 160),
+            }));
           try {
-            result = await checkItem(p, item);
-          } catch (err) {
-            result = { status: 'error', message: (err as Error).message.slice(0, 160) };
-            if (p !== page) {
-              result = await onCleanTab(() => checkItem(page, item)).catch((e) => ({
-                status: 'error' as const,
-                message: (e as Error).message.slice(0, 160),
-              }));
-            }
+            result = await checkItem(p, item, true);
+            // Requestable and allowed → request it on the clean tab right away
+            // (an invitation can close; don't hold it until the scan ends).
+            if (result.status === 'available' && mayClick(item)) result = await onClean();
+          } catch {
+            result = await onClean();
           }
           done++;
           if (result.status === 'error') {
@@ -1619,7 +1612,7 @@ class SessionManager {
         for (const item of failed) {
           let result: { status: InvitationStatus; message?: string };
           try {
-            result = await checkItem(page, item);
+            result = await checkItem(page, item, !mayClick(item));
           } catch (err) {
             result = { status: 'error', message: (err as Error).message.slice(0, 160) };
           }

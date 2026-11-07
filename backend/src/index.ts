@@ -329,29 +329,27 @@ app.get('/api/amazon/invitations/detected-orderable', async () => {
   return { detected };
 });
 
-/** Items a run will visit: the enabled ones, plus — with `refreshDisabled` — the
- *  disabled ones still in store, visited detect-only to unfreeze their verdict. */
-function invitationRunSize(refreshDisabled: boolean): number {
-  return amazonItemsStore.list().filter((i) => i.enabled || (refreshDisabled && i.inStore !== false))
-    .length;
+/** Items a run will visit: every enabled item, plus the disabled ones still in
+ *  store (checked, never requested) — every run is a full check-up. */
+function invitationRunSize(): number {
+  return amazonItemsStore.list().filter((i) => i.enabled || i.inStore !== false).length;
 }
 
-app.post<{ Body: { accountId?: string; dryRun?: boolean; refreshDisabled?: boolean } }>(
+app.post<{ Body: { accountId?: string; dryRun?: boolean } }>(
   '/api/amazon/invitations/run',
   async (req, reply) => {
     const accountId = req.body?.accountId;
     if (!accountId) return reply.code(400).send({ error: 'accountId requis' });
-    const refreshDisabled = req.body?.refreshDisabled === true;
-    const total = invitationRunSize(refreshDisabled);
+    const total = invitationRunSize();
     if (total === 0) return reply.code(400).send({ error: 'Aucun item activé dans le catalogue.' });
     if (sessionManager.isInvitationRunning(accountId)) {
       return reply.code(409).send({ error: 'Tâche déjà en cours pour ce compte.' });
     }
     // Fire-and-forget: progress is streamed over the WebSocket.
     sessionManager
-      .runInvitations(accountId, req.body?.dryRun === true, undefined, refreshDisabled)
+      .runInvitations(accountId, req.body?.dryRun === true)
       .catch((err) => app.log.error({ err }, 'invitation run failed'));
-    return { started: true, total, dryRun: req.body?.dryRun === true, refreshDisabled };
+    return { started: true, total, dryRun: req.body?.dryRun === true };
   }
 );
 
@@ -362,7 +360,6 @@ app.post<{
     proxyIds?: string[];
     proxyGroupId?: string;
     dryRun?: boolean;
-    refreshDisabled?: boolean;
   };
 }>('/api/amazon/invitations/run-batch', async (req, reply) => {
   const body = req.body ?? {};
@@ -372,8 +369,7 @@ app.post<{
     : (body.accountIds ?? []);
   if (accountIds.length === 0) return reply.code(400).send({ error: 'aucun compte (groupe vide ?)' });
 
-  const refreshDisabled = body.refreshDisabled === true;
-  const total = invitationRunSize(refreshDisabled);
+  const total = invitationRunSize();
   if (total === 0) return reply.code(400).send({ error: 'Aucun item activé dans le catalogue.' });
 
   // Resolve the proxy pool (optional). If empty, each account uses its own proxy.
@@ -410,10 +406,10 @@ app.post<{
     }
     started.push(accountId);
     sessionManager
-      .runInvitations(accountId, dryRun, proxyId, refreshDisabled)
+      .runInvitations(accountId, dryRun, proxyId)
       .catch((err) => app.log.error({ err, accountId }, 'invitation run failed'));
   });
-  return { started, skipped, total, dryRun, refreshDisabled, proxyShortfall };
+  return { started, skipped, total, dryRun, proxyShortfall };
 });
 
 // Order history of every account, as last synced from its "Vos commandes" page.
