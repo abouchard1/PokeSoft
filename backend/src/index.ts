@@ -321,6 +321,7 @@ app.get('/api/amazon/invitations/detected-orderable', async () => {
         imageUrl: item?.imageUrl,
         productUrl: item?.productUrl || `https://www.amazon.fr/dp/${r.asin}`,
         detectedAt: r.lastCheckedAt,
+        expiresAt: r.expiresAt,
       };
     })
     // Parked accounts are invisible on the Actions tab — don't smuggle one back.

@@ -141,6 +141,28 @@ const forcedOfferUrl = (asin: string) => `https://www.amazon.fr/dp/${asin}?m=${A
 const ADD_TO_CART_SELECTOR =
   '#add-to-cart-button, input[name="submit.add-to-cart"], #buy-now-button';
 
+/** What a product-page check concludes. `expiresAt` only on `orderable`. */
+type InviteResult = { status: InvitationStatus; message?: string; expiresAt?: number };
+
+/**
+ * An accepted invitation's page says how long is left to order: "Dépêchez-vous,
+ * c'est une offre très demandée. Vous avez 51 heures 28 minutes avant
+ * l'expiration de votre invitation." (in `#hdp-detail-invited-id`,
+ * server-rendered, so the light scan tabs see it too). Returns the remaining
+ * time in ms, or undefined when the sentence isn't there / can't be read.
+ */
+export function parseInviteTimeLeft(text: string): number | undefined {
+  const m = /Vous avez\s+(.{1,60}?)\s+avant l.expiration/i.exec(text.replace(/\s+/g, ' '));
+  if (!m) return undefined;
+  const span = m[1];
+  const num = (re: RegExp) => Number(re.exec(span)?.[1] ?? 0);
+  const days = num(/(\d+)\s*j(?:ours?)?\b/i);
+  const hours = num(/(\d+)\s*h(?:eures?)?\b/i);
+  const minutes = num(/(\d+)\s*min(?:utes?)?\b/i);
+  const ms = ((days * 24 + hours) * 60 + minutes) * 60_000;
+  return ms > 0 ? ms : undefined;
+}
+
 function isMeaningfulUrl(url: string): boolean {
   if (!url) return false;
   if (url === 'about:blank') return false;
@@ -1287,12 +1309,32 @@ class SessionManager {
     throw last ?? new Error('navigation impossible');
   }
 
+  /**
+   * Text of the buy box: the first **non-empty** candidate, in priority order.
+   * Not `.locator('a, b, c').first()` — that picks the first match in *DOM*
+   * order, and since Amazon's 2026-11-10 layout an empty `#rightCol` comes
+   * before the buy box. Every item then read "offre Amazon: " (empty), lost its
+   * "Invitation demandée" and was recorded `unavailable` (65/76 on Remy).
+   */
   private async readBuybox(page: Page): Promise<string> {
     return await page
-      .locator('#buybox, #desktop_buybox, #rightCol, #centerCol')
-      .first()
-      .innerText()
+      .evaluate((sels: string[]) => {
+        for (const sel of sels) {
+          const text = (document.querySelector(sel) as HTMLElement | null)?.innerText ?? '';
+          if (text.trim()) return text;
+        }
+        return '';
+      }, ['#buybox', '#desktop_buybox', '#centerCol', '#rightCol'])
       .catch(() => '');
+  }
+
+  /** Amazon's "Invitation demandée, merci !" block, shown once a request is pending. */
+  private async inviteRequestedShown(page: Page): Promise<boolean> {
+    return await page
+      .locator('#hdp-detail-requested-id')
+      .first()
+      .isVisible()
+      .catch(() => false);
   }
 
   /**
@@ -1311,7 +1353,7 @@ class SessionManager {
     page: Page,
     dryRun: boolean,
     asin?: string
-  ): Promise<{ status: InvitationStatus; message?: string }> {
+  ): Promise<InviteResult> {
     const loginNeeded = () => /\/ap\/signin|\/ap\/cvf/.test(page.url());
     if (loginNeeded()) {
       return { status: 'login', message: 'Connexion Amazon requise pour ce compte.' };
@@ -1359,9 +1401,21 @@ class SessionManager {
     // "invitation" text test, since an accepted offer still mentions the
     // invitation ("Vous avez été invité à acheter…").
     if ((await page.locator(ADD_TO_CART_SELECTOR).count()) > 0) {
-      return { status: 'orderable', message };
+      // The page states the time left to order — the deadline, without the
+      // acceptance mail (which isn't always sent).
+      const invited = await page
+        .locator('#hdp-detail-invited-id')
+        .first()
+        .innerText({ timeout: 2000 })
+        .catch(() => '');
+      const left = parseInviteTimeLeft(invited) ?? parseInviteTimeLeft(buybox);
+      return { status: 'orderable', message, expiresAt: left ? Date.now() + left : undefined };
     }
-    if (/invitation/i.test(buybox)) return { status: 'already', message };
+    // The dedicated block first (visibility, so it holds whatever the layout),
+    // then the buy-box wording as a fallback.
+    if ((await this.inviteRequestedShown(page)) || /invitation/i.test(buybox)) {
+      return { status: 'already', message };
+    }
     return { status: 'unavailable', message };
   }
 
@@ -1520,7 +1574,7 @@ class SessionManager {
         }
         return result;
       };
-      const record = (item: (typeof items)[number], result: { status: InvitationStatus; message?: string }) => {
+      const record = (item: (typeof items)[number], result: InviteResult) => {
         const prev = invitationsStore.get(accountId, item.asin);
         invitationsStore.upsert({
           accountId,
@@ -1529,6 +1583,12 @@ class SessionManager {
           message: result.message,
           requestedAt:
             result.status === 'requested' && mayClick(item) ? Date.now() : prev?.requestedAt,
+          // Deadline read on the page; kept from the previous check if this one
+          // couldn't read it but the invitation is still open.
+          expiresAt:
+            result.status === 'orderable'
+              ? (result.expiresAt ?? (prev?.status === 'orderable' ? prev.expiresAt : undefined))
+              : undefined,
           lastCheckedAt: Date.now(),
         });
       };
@@ -1556,7 +1616,7 @@ class SessionManager {
       const worker = async (p: Page) => {
         while (!aborted && next < items.length) {
           const item = items[next++];
-          let result: { status: InvitationStatus; message?: string };
+          let result: InviteResult;
           const onClean = () =>
             onCleanTab(() => checkItem(page, item, !mayClick(item))).catch((e) => ({
               status: 'error' as const,
@@ -1610,7 +1670,7 @@ class SessionManager {
       // transient, and an item left in `error` was never actually checked.
       if (failed.length > 0 && failed.length < items.length) {
         for (const item of failed) {
-          let result: { status: InvitationStatus; message?: string };
+          let result: InviteResult;
           try {
             result = await checkItem(page, item, !mayClick(item));
           } catch (err) {

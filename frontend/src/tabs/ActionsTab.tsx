@@ -111,10 +111,11 @@ interface OrderableInvitation {
 }
 
 /**
- * Invitation found **accepted on the product page** by a verification run
- * (status `orderable`). Amazon doesn't always send the acceptance mail, so this
- * is the signal that doesn't depend on one. No expiry: the 72 h clock is only
- * known from the mail.
+ * Invitation found **accepted on the product page** by a scan (status
+ * `orderable`). Amazon doesn't always send the acceptance mail, so this is the
+ * signal that doesn't depend on one. `expiresAt` comes from the page's "Vous
+ * avez N heures M minutes avant l'expiration de votre invitation" (absent on
+ * records scanned before it was read).
  */
 interface DetectedOrderable {
   accountId: string;
@@ -124,6 +125,80 @@ interface DetectedOrderable {
   imageUrl?: string;
   productUrl: string;
   detectedAt: number;
+  expiresAt?: number;
+}
+
+/** One card of the "À commander" timeline: mail and page merged per account+product. */
+interface TimelineEntry {
+  key: string;
+  accountId?: string;
+  accountLabel?: string;
+  title: string;
+  imageUrl?: string;
+  productUrl?: string;
+  price?: string;
+  expiresAt?: number;
+  /** Last scan that saw it on the page, when it came from there. */
+  detectedAt?: number;
+  fromMail: boolean;
+  fromPage: boolean;
+}
+
+/**
+ * Mail acceptances and page detections in one list, soonest deadline first.
+ * Same account + ASIN from both sources = one card; the page's deadline wins
+ * (it's Amazon's own countdown, read at the last scan), the mail's 72 h
+ * window fills in otherwise. Expired entries drop out; page entries with no
+ * known deadline go last, newest first.
+ */
+function buildTimeline(
+  mails: OrderableInvitation[],
+  detected: DetectedOrderable[],
+  now: number,
+  parked: Set<string>
+): TimelineEntry[] {
+  const byKey = new Map<string, TimelineEntry>();
+  for (const o of mails) {
+    if (o.expiresAt <= now || (o.accountId && parked.has(o.accountId))) continue;
+    const key = `${o.accountId ?? o.email}:${o.asin ?? o.productName}`;
+    if (byKey.has(key)) continue; // backend already keeps the newest per pair
+    byKey.set(key, {
+      key,
+      accountId: o.accountId,
+      accountLabel: o.accountLabel ?? o.email,
+      title: o.title ?? o.productName,
+      imageUrl: o.imageUrl,
+      productUrl: o.productUrl,
+      price: o.price,
+      expiresAt: o.expiresAt,
+      fromMail: true,
+      fromPage: false,
+    });
+  }
+  for (const d of detected) {
+    if (d.expiresAt && d.expiresAt <= now) continue;
+    const key = `${d.accountId}:${d.asin}`;
+    const prev = byKey.get(key);
+    byKey.set(key, {
+      key,
+      accountId: d.accountId,
+      accountLabel: d.accountLabel ?? prev?.accountLabel,
+      title: d.title ?? prev?.title ?? d.asin,
+      imageUrl: d.imageUrl ?? prev?.imageUrl,
+      productUrl: d.productUrl ?? prev?.productUrl,
+      price: prev?.price,
+      expiresAt: d.expiresAt ?? prev?.expiresAt,
+      detectedAt: d.detectedAt,
+      fromMail: !!prev,
+      fromPage: true,
+    });
+  }
+  return [...byKey.values()].sort((a, b) => {
+    if (a.expiresAt && b.expiresAt) return a.expiresAt - b.expiresAt;
+    if (a.expiresAt) return -1;
+    if (b.expiresAt) return 1;
+    return (b.detectedAt ?? 0) - (a.detectedAt ?? 0);
+  });
 }
 
 /** "2 j 5 h", "5 h 12 min" or "23 min" left until `expiresAt`. */
@@ -840,10 +915,10 @@ export default function ActionsTab({ connected: _connected }: Props) {
               À commander — invitations acceptées
             </h2>
             <p className="text-xs text-zinc-500 mt-1">
-              Deux sources : les mails Amazon « Félicitations, vous êtes invité à passer commande »
-              de moins de 72 h (lecture Gmail seule, aucune action sur Amazon), et les acceptations
-              relevées directement sur la page produit par « Scanner » — Amazon n'envoie pas
-              toujours le mail.
+              Une seule timeline, échéance la plus proche en premier. Deux sources fusionnées
+              par compte et produit : la page produit relevée par « Scanner » (« Vous avez N heures
+              avant l'expiration… » — fiable même sans mail) et les mails « Félicitations, vous
+              êtes invité à passer commande » de moins de 72 h.
             </p>
           </div>
           <button
@@ -856,78 +931,89 @@ export default function ActionsTab({ connected: _connected }: Props) {
           </button>
         </div>
 
-        {orderableError ? (
-          <div className="text-xs px-3 py-2 rounded border bg-red-950 border-red-800 text-red-200">
-            {orderableError}
+        {orderableError && (
+          <div className="mb-3 text-xs px-3 py-2 rounded border bg-red-950 border-red-800 text-red-200">
+            Mails : {orderableError}
           </div>
-        ) : (() => {
-          // Parked accounts are gone from this tab — an acceptance for one would
-          // otherwise bring it back here with a "Commander" button that opens a
-          // session for an account the carnet says not to use.
-          const live = orderable.filter(
-            (o) => o.expiresAt > now && !(o.accountId && parkedAccountIds.has(o.accountId))
-          );
-          if (live.length === 0) {
+        )}
+        {(() => {
+          const timeline = buildTimeline(orderable, detected, now, parkedAccountIds);
+          if (timeline.length === 0) {
             return (
               <p className="text-xs text-zinc-500">
                 {orderableChecked
                   ? 'Aucune invitation acceptée en attente de commande.'
-                  : 'Clique sur « Vérifier les mails ».'}
+                  : 'Clique sur « Vérifier les mails » ou lance un « Scanner ».'}
               </p>
             );
           }
           return (
             <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {live.map((o, idx) => {
-                const left = o.expiresAt - now;
-                const hoursLeft = left / 3_600_000;
+              {timeline.map((t) => {
+                const left = t.expiresAt ? t.expiresAt - now : undefined;
+                const hoursLeft = left !== undefined ? left / 3_600_000 : undefined;
                 const urgency =
-                  hoursLeft < 6
-                    ? 'bg-red-950 border-red-800 text-red-200'
-                    : hoursLeft < 24
-                      ? 'bg-amber-950 border-amber-800 text-amber-200'
-                      : 'bg-emerald-950 border-emerald-800 text-emerald-200';
-                const key = `${o.email}:${o.asin ?? o.productName}:${idx}`;
-                const launching = orderLaunching.has(key);
+                  hoursLeft === undefined
+                    ? 'bg-zinc-900 border-zinc-700 text-zinc-400'
+                    : hoursLeft < 6
+                      ? 'bg-red-950 border-red-800 text-red-200'
+                      : hoursLeft < 24
+                        ? 'bg-amber-950 border-amber-800 text-amber-200'
+                        : 'bg-emerald-950 border-emerald-800 text-emerald-200';
+                const launching = orderLaunching.has(t.key);
+                const sources = [
+                  t.fromPage &&
+                    `page (scan du ${new Date(t.detectedAt ?? 0).toLocaleString('fr-FR')})`,
+                  t.fromMail && 'mail d’acceptation',
+                ]
+                  .filter(Boolean)
+                  .join(' + ');
                 return (
                   <li
-                    key={key}
+                    key={t.key}
                     className="bg-zinc-950/40 border border-zinc-800 rounded-lg p-2.5 flex gap-3"
                   >
                     <div className="w-16 h-16 shrink-0 bg-white rounded overflow-hidden flex items-center justify-center">
-                      {o.imageUrl ? (
-                        <img src={o.imageUrl} alt="" loading="lazy" className="w-full h-full object-contain" />
+                      {t.imageUrl ? (
+                        <img src={t.imageUrl} alt="" loading="lazy" className="w-full h-full object-contain" />
                       ) : (
                         <ShoppingCart size={20} className="text-zinc-400" />
                       )}
                     </div>
                     <div className="flex-1 min-w-0 flex flex-col justify-between gap-1">
                       <div>
-                        <p className="text-xs leading-tight line-clamp-2" title={o.title ?? o.productName}>
-                          {o.title ?? o.productName}
+                        <p className="text-xs leading-tight line-clamp-2" title={t.title}>
+                          {t.title}
                         </p>
                         <div className="flex items-center gap-1.5 flex-wrap mt-1">
-                          {o.accountLabel && (
+                          {t.accountLabel && (
                             <span className="text-[10px] px-1.5 py-px rounded bg-emerald-950 border border-emerald-800 text-emerald-200">
-                              {o.accountLabel}
+                              {t.accountLabel}
                             </span>
                           )}
-                          {o.price && <span className="text-[10px] text-zinc-400">{o.price}</span>}
+                          {t.price && <span className="text-[10px] text-zinc-400">{t.price}</span>}
+                          <span className="text-[10px] text-zinc-500" title={`Source : ${sources}`}>
+                            {t.fromPage && t.fromMail ? 'page + mail' : t.fromPage ? 'page' : 'mail'}
+                          </span>
                         </div>
                       </div>
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <span
                           className={`text-[10px] px-1.5 py-px rounded border ${urgency}`}
-                          title={`Expire le ${new Date(o.expiresAt).toLocaleString('fr-FR')}`}
+                          title={
+                            t.expiresAt
+                              ? `Expire le ${new Date(t.expiresAt).toLocaleString('fr-FR')} — source : ${sources}`
+                              : `Échéance pas encore lue — relance « Scanner ». Source : ${sources}`
+                          }
                         >
-                          {formatTimeLeft(left)}
+                          {left !== undefined ? formatTimeLeft(left) : 'échéance inconnue'}
                         </span>
                         <button
-                          onClick={() => orderViaSession(o, key)}
+                          onClick={() => orderViaSession(t, t.key)}
                           disabled={launching}
                           title={
-                            o.accountId
-                              ? `Ouvre une session ${o.accountLabel ?? ''} (proxy + cookies) sur la page produit`
+                            t.accountId
+                              ? `Ouvre une session ${t.accountLabel ?? ''} (proxy + cookies) sur la page produit`
                               : 'Compte introuvable — ouvre la page Amazon dans un onglet'
                           }
                           className="inline-flex items-center gap-1 text-[10px] bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white px-2 py-1 rounded"
@@ -943,67 +1029,6 @@ export default function ActionsTab({ connected: _connected }: Props) {
             </ul>
           );
         })()}
-
-        {detected.length > 0 && (
-          <div className="mt-4 pt-3 border-t border-zinc-800">
-            <p className="text-xs text-zinc-400 mb-2">
-              <span className="text-sky-300 font-medium">Détectées sur la page produit</span> — l'offre
-              Amazon est passée en achat direct pour ce compte, sans mail d'acceptation. Relève du
-              dernier « Scanner » ; la fenêtre de 72 h n'est pas connue ici.
-            </p>
-            <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-              {detected.map((d) => {
-                const key = `detected:${d.accountId}:${d.asin}`;
-                const launching = orderLaunching.has(key);
-                return (
-                  <li
-                    key={key}
-                    className="bg-zinc-950/40 border border-sky-900/60 rounded-lg p-2.5 flex gap-3"
-                  >
-                    <div className="w-16 h-16 shrink-0 bg-white rounded overflow-hidden flex items-center justify-center">
-                      {d.imageUrl ? (
-                        <img src={d.imageUrl} alt="" loading="lazy" className="w-full h-full object-contain" />
-                      ) : (
-                        <ShoppingCart size={20} className="text-zinc-400" />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0 flex flex-col justify-between gap-1">
-                      <div>
-                        <p className="text-xs leading-tight line-clamp-2" title={d.title ?? d.asin}>
-                          {d.title ?? d.asin}
-                        </p>
-                        <div className="flex items-center gap-1.5 flex-wrap mt-1">
-                          {d.accountLabel && (
-                            <span className="text-[10px] px-1.5 py-px rounded bg-sky-950 border border-sky-800 text-sky-200">
-                              {d.accountLabel}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span
-                          className="text-[10px] text-zinc-500"
-                          title={new Date(d.detectedAt).toLocaleString('fr-FR')}
-                        >
-                          vu le {new Date(d.detectedAt).toLocaleDateString('fr-FR')}
-                        </span>
-                        <button
-                          onClick={() => orderViaSession(d, key)}
-                          disabled={launching}
-                          title={`Ouvre une session ${d.accountLabel ?? ''} (proxy + cookies) sur la page produit`}
-                          className="inline-flex items-center gap-1 text-[10px] bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white px-2 py-1 rounded"
-                        >
-                          {launching ? 'Ouverture…' : 'Commander'}
-                          <ExternalLink size={11} />
-                        </button>
-                      </div>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        )}
 
         {orderError && (
           <div className="mt-3 text-xs px-3 py-2 rounded border bg-red-950 border-red-800 text-red-200">

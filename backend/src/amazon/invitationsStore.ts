@@ -26,6 +26,9 @@ export interface InvitationRecord {
   status: InvitationStatus;
   message?: string;
   requestedAt?: number;
+  /** `orderable` only: when the invitation lapses, from the page's "Vous avez
+   *  N heures M minutes avant l'expiration de votre invitation". */
+  expiresAt?: number;
   lastCheckedAt: number;
 }
 
