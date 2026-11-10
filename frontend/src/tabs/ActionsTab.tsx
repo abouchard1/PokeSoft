@@ -62,6 +62,8 @@ interface InvRunState {
   lastStatus?: string;
   counts?: Record<string, number>;
   error?: string;
+  /** Finished, but with something to look at (e.g. unrecognised product pages). */
+  warning?: string;
 }
 
 // Backend per-account progress (WS snapshot / GET) → UI run state.
@@ -86,6 +88,7 @@ function progressToRun(p: InvitationProgress): InvRunState {
     lastStatus: p.lastStatus,
     counts: p.counts,
     error: p.status === 'error' ? p.message : undefined,
+    warning: p.status === 'done' ? p.message : undefined,
   };
 }
 
@@ -386,7 +389,15 @@ export default function ActionsTab({ connected: _connected }: Props) {
       if (msg.type === 'invitation.done') {
         setInvRuns((r) =>
           r[msg.accountId]
-            ? { ...r, [msg.accountId]: { ...r[msg.accountId], running: false, counts: msg.counts } }
+            ? {
+                ...r,
+                [msg.accountId]: {
+                  ...r[msg.accountId],
+                  running: false,
+                  counts: msg.counts,
+                  warning: msg.message,
+                },
+              }
             : r
         );
         // A run is what discovers an accepted invitation — pick it up right away.
@@ -843,7 +854,7 @@ export default function ActionsTab({ connected: _connected }: Props) {
                       <div className="mt-2">
                         <div
                           className={`flex items-center justify-between text-[10px] mb-1 ${
-                            runErrors > 0 ? 'text-amber-400' : 'text-zinc-400'
+                            runErrors > 0 || run.warning ? 'text-amber-400' : 'text-zinc-400'
                           }`}
                         >
                           <span>
@@ -856,6 +867,11 @@ export default function ActionsTab({ connected: _connected }: Props) {
                                   : runErrors > 0
                                     ? `⚠ terminé, ${runErrors} item(s) en échec — à relancer`
                                     : `terminé ${run.done}/${run.total}${run.dryRun ? ' (vérif)' : ''}`}
+                            {!run.error && !run.running && run.warning && (
+                              <span className="block" title={run.warning}>
+                                ⚠ {run.warning}
+                              </span>
+                            )}
                           </span>
                         </div>
                         {!run.error && (

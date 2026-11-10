@@ -1,7 +1,7 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { anonymizeProxy, closeAnonymizedProxy } from 'proxy-chain';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { WebSocket } from 'ws';
 import { proxyStore } from '../proxies.js';
@@ -93,6 +93,8 @@ export type Event =
       accountId: string;
       total: number;
       counts: Record<string, number>;
+      /** Set when the run finished but something deserves a look (unreadable pages). */
+      message?: string;
     }
   | { type: 'invitation.error'; accountId: string; message: string }
   | { type: 'orders.progress'; progress: OrderSyncProgress }
@@ -142,7 +144,21 @@ const ADD_TO_CART_SELECTOR =
   '#add-to-cart-button, input[name="submit.add-to-cart"], #buy-now-button';
 
 /** What a product-page check concludes. `expiresAt` only on `orderable`. */
-type InviteResult = { status: InvitationStatus; message?: string; expiresAt?: number };
+type InviteResult = {
+  status: InvitationStatus;
+  message?: string;
+  expiresAt?: number;
+  /** `error` because the page didn't carry the evidence for any verdict. */
+  unrecognized?: boolean;
+};
+
+/**
+ * A run aborts when this share of its checked items came back unrecognised
+ * (after a retry on the clean tab), once at least `UNRECOGNIZED_MIN` did.
+ * One odd page is noise; a fifth of the catalogue is Amazon changing layout.
+ */
+const UNRECOGNIZED_ABORT_RATIO = 0.2;
+const UNRECOGNIZED_MIN = 5;
 
 /**
  * An accepted invitation's page says how long is left to order: "Dépêchez-vous,
@@ -1416,7 +1432,57 @@ class SessionManager {
     if ((await this.inviteRequestedShown(page)) || /invitation/i.test(buybox)) {
       return { status: 'already', message };
     }
+    // `unavailable` is the verdict reached by elimination, so it is the one a
+    // layout change silently produces (2026-11-10: empty buy box read → 65/76
+    // "indispo"). It needs its own evidence — see `pageEvidence`.
+    const evidence = await this.pageEvidence(page, buybox);
+    if (evidence === 'logged-out') {
+      return { status: 'login', message: 'Déconnecté en cours de run (salutation « Identifiez-vous »).' };
+    }
+    if (evidence) {
+      return { status: 'error', unrecognized: true, message: `page non reconnue: ${evidence}` };
+    }
     return { status: 'unavailable', message };
+  }
+
+  /**
+   * Is this page something we can honestly call `unavailable`? Returns
+   * undefined when yes, else why not. Needs: still logged in (a logged-out page
+   * just has no invite widget), a real product page (`#productTitle` visible —
+   * not a captcha / error / interstitial), and a non-empty buy box (every real
+   * "indispo" has one: "Actuellement indisponible", "Voir toutes les offres",
+   * "Prix plus élevé que d'habitude"…). Deliberately structural, no wording
+   * whitelist — that would raise false alarms on every rephrasing.
+   */
+  private async pageEvidence(page: Page, buybox: string): Promise<string | undefined> {
+    const s = await page
+      .evaluate(() => {
+        const title = document.querySelector('#productTitle') as HTMLElement | null;
+        const greeting = document.querySelector('#nav-link-accountList-nav-line-1') as HTMLElement | null;
+        return {
+          title: !!title && title.getClientRects().length > 0 && !!title.innerText.trim(),
+          greeting: greeting?.innerText ?? '',
+        };
+      })
+      .catch(() => ({ title: false, greeting: '' }));
+    if (/identifiez-vous|sign\s*in/i.test(s.greeting)) return 'logged-out';
+    if (!s.title) return 'pas de titre produit (captcha, erreur ou nouvelle mise en page)';
+    if (!buybox.trim()) return 'cadre d’achat vide ou introuvable';
+    return undefined;
+  }
+
+  /** Screenshot + HTML of a page we couldn't read, for fixing selectors fast. */
+  private async savePageSnapshot(page: Page, label: string): Promise<string | undefined> {
+    try {
+      const dir = resolve(process.cwd(), '..', 'data', 'page-snapshots');
+      mkdirSync(dir, { recursive: true });
+      const base = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}-${label.replace(/[^\w-]+/g, '_')}`;
+      await page.screenshot({ path: resolve(dir, `${base}.png`), fullPage: true }).catch(() => {});
+      writeFileSync(resolve(dir, `${base}.html`), await page.content(), 'utf8');
+      return `data/page-snapshots/${base}.{png,html}`;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1576,6 +1642,10 @@ class SessionManager {
       };
       const record = (item: (typeof items)[number], result: InviteResult) => {
         const prev = invitationsStore.get(accountId, item.asin);
+        // A page we couldn't read (navigation failure, unrecognised layout) says
+        // nothing about the item: keep the last real verdict and its date, so
+        // freshest-wins isn't fed a non-observation.
+        if (result.status === 'error' && prev && prev.status !== 'error') return;
         invitationsStore.upsert({
           accountId,
           asin: item.asin,
@@ -1602,6 +1672,13 @@ class SessionManager {
       let consecutiveErrors = 0;
       let aborted = false;
       let next = 0;
+      // Pages that carried no evidence for any verdict even on the clean tab.
+      // Past UNRECOGNIZED_ABORT_RATIO the run stops: Amazon changed the page and
+      // every further verdict would be a guess (see `pageEvidence`).
+      let unrecognized = 0;
+      const unrecognizedAsins = new Set<string>();
+      let layoutBroken = false;
+      let snapshot: string | undefined;
       const failed: typeof items = [];
       // The unblocked tab, shared one item at a time. It takes the clicks, and
       // the retries of a light tab that failed (typically the AWS WAF challenge
@@ -1618,20 +1695,34 @@ class SessionManager {
           const item = items[next++];
           let result: InviteResult;
           const onClean = () =>
-            onCleanTab(() => checkItem(page, item, !mayClick(item))).catch((e) => ({
-              status: 'error' as const,
-              message: (e as Error).message.slice(0, 160),
-            }));
+            onCleanTab(async () => {
+              const r = await checkItem(page, item, !mayClick(item));
+              // Keep the first unreadable page as it was, to fix selectors fast.
+              if (r.unrecognized && !snapshot) {
+                snapshot = await this.savePageSnapshot(page, `${account.prenom}-${item.asin}`);
+              }
+              return r;
+            }).catch(
+              (e): InviteResult => ({ status: 'error', message: (e as Error).message.slice(0, 160) })
+            );
           try {
             result = await checkItem(p, item, true);
             // Requestable and allowed → request it on the clean tab right away
             // (an invitation can close; don't hold it until the scan ends).
-            if (result.status === 'available' && mayClick(item)) result = await onClean();
+            // Unreadable on a light tab → give it a full render before judging.
+            if ((result.status === 'available' && mayClick(item)) || result.unrecognized) {
+              result = await onClean();
+            }
           } catch {
             result = await onClean();
           }
           done++;
-          if (result.status === 'error') {
+          if (result.unrecognized) {
+            // Not a connection problem: doesn't feed the "connexion perdue" streak.
+            unrecognized++;
+            unrecognizedAsins.add(item.asin);
+            failed.push(item);
+          } else if (result.status === 'error') {
             consecutiveErrors++;
             failed.push(item);
           } else {
@@ -1655,12 +1746,18 @@ class SessionManager {
             total: items.length,
           });
           if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) aborted = true;
+          if (unrecognized >= UNRECOGNIZED_MIN && unrecognized / done > UNRECOGNIZED_ABORT_RATIO) {
+            aborted = true;
+            layoutBroken = true;
+          }
         }
       };
       await Promise.all(pages.map(worker));
       if (aborted) {
         const left = items.length - done;
-        const message = `Connexion perdue après ${consecutiveErrors} échecs d'affilée — run interrompu, ${left} item(s) non traité(s). Vérifiez le proxy puis relancez.`;
+        const message = layoutBroken
+          ? `⚠ Page produit Amazon non reconnue sur ${unrecognized}/${done} produits — Amazon a sans doute changé sa mise en page. Run interrompu, aucun état écrasé.${snapshot ? ` Capture : ${snapshot}` : ''}`
+          : `Connexion perdue après ${consecutiveErrors} échecs d'affilée — run interrompu, ${left} item(s) non traité(s). Vérifiez le proxy puis relancez.`;
         this.setInvitationProgress(accountId, { status: 'error', done, counts, message });
         this.emit({ type: 'invitation.error', accountId, message });
         return;
@@ -1677,6 +1774,7 @@ class SessionManager {
             result = { status: 'error', message: (err as Error).message.slice(0, 160) };
           }
           if (result.status === 'error') continue; // keep the first-pass record
+          if (unrecognizedAsins.delete(item.asin)) unrecognized--;
           if (counts.error) counts.error--;
           if (!counts.error) delete counts.error;
           counts[result.status] = (counts[result.status] ?? 0) + 1;
@@ -1693,13 +1791,19 @@ class SessionManager {
         }
       }
 
+      const doneMessage = unrecognized
+        ? `${unrecognized} page(s) produit non reconnue(s) — état précédent conservé.${snapshot ? ` Capture : ${snapshot}` : ''}`
+        : undefined;
       this.setInvitationProgress(accountId, {
         status: 'done',
         done: items.length,
         total: items.length,
         counts,
+        // Below the abort threshold, still say so: a few unreadable pages can be
+        // the first sign of a layout rolling out.
+        message: doneMessage,
       });
-      this.emit({ type: 'invitation.done', accountId, total: items.length, counts });
+      this.emit({ type: 'invitation.done', accountId, total: items.length, counts, message: doneMessage });
     } catch (err) {
       const message = (err as Error).message;
       this.setInvitationProgress(accountId, { status: 'error', message });
